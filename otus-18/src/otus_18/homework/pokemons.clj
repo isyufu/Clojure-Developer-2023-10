@@ -1,9 +1,9 @@
 (ns otus-18.homework.pokemons
-  (:require [clj-http.client :as client]
-            [cheshire.core :as cheshire]
+  (:require [cheshire.core :as cheshire]
+            [clj-http.client :as client]
             [clojure.core.async :as a :refer [<! <!! >!
                                               chan close!
-                                              go  onto-chan!
+                                              go onto-chan!
                                               thread]]))
 
 (def base-url "https://pokeapi.co/api/v2")
@@ -37,26 +37,24 @@
   "xform may be nil"
   [url & xform]
   (go (as-> (<! (async-get url)) m
-        (:body m)
-        (cheshire/parse-string m true)
-        (if (some? xform) ((first xform) m) m))))
+            (:body m)
+            (cheshire/parse-string m true)
+            (if (some? xform) ((first xform) m) m))))
 
 ; генерируем урлы получения списка покемонов, например по 20 штук
 (defn generate-pokemon-urls
   ([total] (generate-pokemon-urls total 20))
   ([total batch-size]
-   (loop [offset 0
-          limit batch-size
-          res []]
-     (if (< offset total)
-       (recur (+ offset batch-size)
-              (min batch-size (- total offset limit))
-              (conj res (str pokemons-url "?offset=" offset "&limit=" limit)))
-       res))))
+   (map (fn [offset]
+          (str pokemons-url "?offset=" offset "&limit=" (min batch-size (- total offset))))
+        (range 0 total batch-size))
+   ))
 
-(defn translated-types [lang]
-  (let [in> (chan 20)
-        out> (chan 20)
+(defn translated-types
+  "Получение переведенных типов"
+  [lang]
+  (let [in> (chan)
+        out> (chan)
         blocking-get-type-name (fn [u] (get-parse-xform u (fn [r] [(:name r) (extract-type-name r lang)])))]
 
     (a/pipeline-blocking n-concurency out> (map blocking-get-type-name) in>)
@@ -67,37 +65,40 @@
              (onto-chan! in>)))
 
     (let [result (<!! (a/into {} out>))]
-      (close! in>)
-      (close! out>)
       result)))
 
 (defn pokemons-types [count lang]
-  (let [type-names-lang (translated-types lang)
-        in> (chan 20)
-        mdl> (chan count)
-        out> (chan count)
-        async-fn (fn [url out*]
-                   (go
-                     (let [arr (get-parse-xform url :results)]
-                       (doseq [x arr]
-                         (>! out* x)))
-                     (close! out*)))
+  (let [type-names-lang  (translated-types lang)      ; синхронное получение типов 2,5 сек
+        batch-size 20
+        in> (chan)
+        mdl> (chan)
+        mdl-2> (chan)
+        out> (chan)
+
+        ; получаем списки url покемонов (по batch-size)
+        bl-get-pokes (fn [url] (get-parse-xform url :results))
+
+        ; можно сказать flatten, pipe массивов в пайп элементов из массивов
+        async-fn (fn [arr out*]
+                   (go (doseq [x arr]
+                         (>! out* x))
+                       (close! out*)))
+
+        ; получаем покемона, и ищем его тип в type-names-lang
         bl-parse-poke (fn [{name :name url :url}]
-                        (let [body-types (get-parse-xform url :types)
+                        (let [
+                              body-types (get-parse-xform url :types)
                               type-names (mapv (fn [t] (type-names-lang (get-in t [:type :name]))) body-types)]
                           {:name name :types type-names}))]
-
     ; пайплайны
-    (a/pipeline-async n-concurency mdl> async-fn in>)
-    (a/pipeline-blocking n-concurency out> (map bl-parse-poke) mdl>)
+    (a/pipeline-blocking n-concurency mdl> (map bl-get-pokes) in>)
+    (a/pipeline-async n-concurency mdl-2> async-fn mdl>)
+    (a/pipeline-blocking n-concurency out> (map bl-parse-poke) mdl-2>)
 
     ; начало обработки
-    (go (a/onto-chan! in> (generate-pokemon-urls count count)))
+    (go (a/onto-chan! in> (generate-pokemon-urls count batch-size))) ; генерируем урлы
 
     (let [result (<!! (a/into [] out>))]
-      (close! in>)
-      (close! mdl>)
-      (close! out>)
       result)))
 
 (defn get-pokemons
@@ -107,4 +108,6 @@
   (pokemons-types limit lang))
 
 (comment
-  (pokemons-types 12 "ja"))
+  (generate-pokemon-urls 55)
+  (time (pokemons-types 55 "ja"))
+  )
