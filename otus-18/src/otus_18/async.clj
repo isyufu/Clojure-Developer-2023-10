@@ -97,7 +97,7 @@
 (def ca> (chan 1))
 (def cb> (chan 1))
 
-(defn c-af [val result] ; notice the signature is different for `pipeline-async`, it includes a channel
+(defn c-af [val result]                                     ; notice the signature is different for `pipeline-async`, it includes a channel
   (go (<! (timeout 1000))
       (>! result (str val "!!!"))
       (>! result (str val "!!!"))

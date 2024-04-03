@@ -3,7 +3,7 @@
             [clj-http.client :as client]
             [clojure.core.async :as a :refer [<! <!! >!
                                               chan close!
-                                              go onto-chan!
+                                              go go-loop onto-chan!
                                               thread]]))
 
 (def base-url "https://pokeapi.co/api/v2")
@@ -11,8 +11,6 @@
 (def type-path (str base-url "/type"))
 
 (def n-concurency 5)
-(defn extract-pokemon-name [pokemon]
-  (:name pokemon))
 
 (defn extract-type-name [pokemon-type lang]
   (->> (:names pokemon-type)
@@ -51,11 +49,12 @@
    ))
 
 (defn translated-types
-  "Получение переведенных типов"
-  [lang]
+  "Получение переведенных типов.
+  {:id :name :lang :translate} для save-xform"
+  [lang save-xform]
   (let [in> (chan)
         out> (chan)
-        blocking-get-type-name (fn [u] (get-parse-xform u (fn [r] [(:name r) (extract-type-name r lang)])))]
+        blocking-get-type-name (fn [u] (get-parse-xform u (fn [r] {:name (:name r) :lang lang :id (:id r) :translate (extract-type-name r lang)})))]
 
     (a/pipeline-blocking n-concurency out> (map blocking-get-type-name) in>)
 
@@ -64,17 +63,22 @@
              (map :url)
              (onto-chan! in>)))
 
-    (let [result (<!! (a/into {} out>))]
-      result)))
+    (<!! (go-loop []
+           (when-let [x (<! out>)]
+             (save-xform x)
+             (recur))
+           )))
+  )
 
-(defn pokemons-types [count lang]
-  (let [type-names-lang  (translated-types lang)      ; синхронное получение типов 2,5 сек
+(defn pokemons [total save-xform]
+  "Получение покемонов.
+   {:id :name :types[:name]} для save-xform"
+  (let [
         batch-size 20
         in> (chan)
         mdl> (chan)
         mdl-2> (chan)
         out> (chan)
-
         ; получаем списки url покемонов (по batch-size)
         bl-get-pokes (fn [url] (get-parse-xform url :results))
 
@@ -83,29 +87,31 @@
                    (go (doseq [x arr]
                          (>! out* x))
                        (close! out*)))
-
-        ; получаем покемона, и ищем его тип в type-names-lang
+        ; получаем покемона,
         bl-parse-poke (fn [{name :name url :url}]
                         (let [
-                              body-types (get-parse-xform url :types)
-                              type-names (mapv (fn [t] (type-names-lang (get-in t [:type :name]))) body-types)]
-                          {:name name :types type-names}))]
+                              body (get-parse-xform url (fn [m] (select-keys m [:types :id])))
+                              id (:id body)
+                              type-names (mapv (fn [t] (get-in t [:type :name])) (:types body))
+
+                              ]
+                          {:id id :name name :types type-names}
+                          ))
+        ]
+
     ; пайплайны
     (a/pipeline-blocking n-concurency mdl> (map bl-get-pokes) in>)
     (a/pipeline-async n-concurency mdl-2> async-fn mdl>)
     (a/pipeline-blocking n-concurency out> (map bl-parse-poke) mdl-2>)
 
     ; начало обработки
-    (go (a/onto-chan! in> (generate-pokemon-urls count batch-size))) ; генерируем урлы
+    (go (a/onto-chan! in> (generate-pokemon-urls total batch-size))) ; генерируем урлы
 
-    (let [result (<!! (a/into [] out>))]
-      result)))
-
-(defn get-pokemons
-  "Асинхронно запрашивает список покемонов и название типов в заданном языке. Возвращает map, где ключами являются
-  имена покемонов (на английском английский), а значения - коллекция названий типов на заданном языке."
-  [& {:keys [limit lang] :or {limit 50 lang "ja"}}]
-  (pokemons-types limit lang))
+    (<!! (go-loop []
+           (when-let [x (<! out>)]
+             (save-xform x)
+             (recur))))
+    ))
 
 (comment
   (generate-pokemon-urls 55)
